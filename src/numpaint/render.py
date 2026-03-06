@@ -1,16 +1,24 @@
 from __future__ import annotations
 
+import os
+import sys
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import cv2
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
+from . import colors_ru
 from . import layout
 
 
 ArrayLike = np.ndarray
+
+# Минимальная площадь области (в пикселях), при которой рисуется номер; иначе — пропуск
+MIN_AREA_TO_DRAW_NUMBER = 200
+# Норма площади для масштаба шрифта: sqrt(area) / AREA_SCALE_FONT даёт множитель к font_scale
+AREA_SCALE_FONT = 55.0
 
 
 def build_palette_hex(palette_bgr: ArrayLike) -> list[str]:
@@ -48,20 +56,20 @@ def _compute_font_params(h: int, w: int) -> tuple[float, int]:
 
 
 MIN_LEGEND_ROW_HEIGHT = 28
+LEGEND_WIDTH = 300
 
 
 def _render_legend(
     height: int,
     palette_bgr: np.ndarray,
     hex_colors: list[str],
+    color_names: Optional[list[str]] = None,
 ) -> np.ndarray:
     """
-    Рисует вертикальную легенду: цветной прямоугольник + номер + hex.
-    Высота должна быть не меньше n * MIN_LEGEND_ROW_HEIGHT, чтобы поместились все цвета.
+    Рисует вертикальную легенду: цветной прямоугольник + номер + название цвета (рус.) или hex.
     """
     n = len(palette_bgr)
-    legend_width = 260
-    legend = np.full((height, legend_width, 3), 255, dtype=np.uint8)
+    legend = np.full((height, LEGEND_WIDTH, 3), 255, dtype=np.uint8)
 
     if n == 0:
         return legend
@@ -91,18 +99,46 @@ def _render_legend(
             lineType=cv2.LINE_AA,
         )
 
-        cv2.putText(
-            legend,
-            hex_str,
-            (x2 + 40, y2 - 8),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (0, 0, 0),
-            1,
-            lineType=cv2.LINE_AA,
-        )
+        label_text = (color_names[idx - 1] if color_names and idx <= len(color_names) else hex_str)
+        tx_label = x2 + 40
+        ty_label = y2 - 6
+        if color_names and any(ord(c) > 127 for c in label_text):
+            font_pil = _get_cyrillic_font(size=14)
+            if font_pil is not None:
+                x1_r, y1_r = tx_label, max(0, ty_label - 18)
+                x2_r, y2_r = min(LEGEND_WIDTH, tx_label + 240), min(height, ty_label + 4)
+                roi = legend[y1_r:y2_r, x1_r:x2_r].copy()
+                pil_roi = Image.fromarray(cv2.cvtColor(roi, cv2.COLOR_BGR2RGB))
+                draw = ImageDraw.Draw(pil_roi)
+                draw.text((0, 0), label_text, font=font_pil, fill=(0, 0, 0))
+                legend[y1_r:y2_r, x1_r:x2_r] = cv2.cvtColor(np.array(pil_roi), cv2.COLOR_RGB2BGR)
+            else:
+                cv2.putText(legend, hex_str, (tx_label, ty_label), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+        else:
+            cv2.putText(legend, label_text, (tx_label, ty_label), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 0), 1, lineType=cv2.LINE_AA)
 
     return legend
+
+
+def _get_cyrillic_font(size: int = 14) -> Optional[ImageFont.FreeTypeFont]:
+    """Шрифт с поддержкой кириллицы для подписей в палитре."""
+    candidates = []
+    if sys.platform == "win32":
+        candidates.extend([
+            os.path.expandvars(r"%WINDIR%\Fonts\arial.ttf"),
+            os.path.expandvars(r"%WINDIR%\Fonts\calibri.ttf"),
+        ])
+    candidates.extend([
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    ])
+    for path in candidates:
+        if path and os.path.isfile(path):
+            try:
+                return ImageFont.truetype(path, size)
+            except Exception:
+                continue
+    return None
 
 
 def _build_boundary_mask(label_map: np.ndarray) -> np.ndarray:
@@ -183,32 +219,51 @@ def render_outline_with_numbers(
         boundary_thick = cv2.dilate(boundary, kernel)
         outline[boundary_thick.astype(bool)] = (0, 0, 0)
 
-    # Номера цветов по центрам областей (из переданных контуров)
+    # Рамка по размеру изображения (граница холста)
+    cv2.rectangle(outline, (0, 0), (w - 1, h - 1), (0, 0, 0), thickness=boundary_line_thickness)
+
+    # Номера: размещаем в самом широком месте контура, подбираем размер по вписыванию
     for color_idx, contours in contours_by_color.items():
         label_str = str(int(color_idx) + 1)
         for cnt in contours:
-            cx, cy = layout.contour_center(cnt)
+            area = cv2.contourArea(cnt)
+            if area < MIN_AREA_TO_DRAW_NUMBER:
+                continue
+            cnt_arr = np.asarray(cnt, dtype=np.int32)
+            cx, cy = layout.contour_widest_point(cnt_arr, (h, w))
+            if not (0 <= cx < w and 0 <= cy < h):
+                cx, cy = layout.contour_center(cnt)
             if not (0 <= cx < w and 0 <= cy < h):
                 continue
-            cv2.putText(
-                outline,
-                label_str,
-                (cx - 8, cy + 8),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                font_scale,
-                (0, 0, 0),
-                thickness,
-                lineType=cv2.LINE_AA,
-            )
+            for scale in [1.0, 0.75, 0.55, 0.4, 0.3]:
+                font_scale_region = max(0.25, font_scale * scale)
+                thickness_region = max(1, int(round(thickness * scale)))
+                (tw, th), _ = cv2.getTextSize(
+                    label_str, cv2.FONT_HERSHEY_SIMPLEX, font_scale_region, thickness_region
+                )
+                if layout.rect_fits_in_contour(cnt_arr, cx, cy, tw, th):
+                    tx = cx - tw // 2
+                    ty = cy + th // 2
+                    cv2.putText(
+                        outline,
+                        label_str,
+                        (tx, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        font_scale_region,
+                        (0, 0, 0),
+                        thickness_region,
+                        lineType=cv2.LINE_AA,
+                    )
+                    break
 
     n_colors = len(palette_bgr)
     legend_height = max(h, n_colors * MIN_LEGEND_ROW_HEIGHT)
-    legend_width = 260
     hex_colors = build_palette_hex(palette_bgr)
-    legend = _render_legend(legend_height, palette_bgr, hex_colors)
-    combined = np.full((legend_height, w + legend_width, 3), 255, dtype=np.uint8)
+    color_names = colors_ru.build_palette_russian_names(palette_bgr)
+    legend = _render_legend(legend_height, palette_bgr, hex_colors, color_names=color_names)
+    combined = np.full((legend_height, w + LEGEND_WIDTH, 3), 255, dtype=np.uint8)
     combined[:h, :w] = outline
-    combined[:legend_height, w : w + legend_width] = legend
+    combined[:legend_height, w : w + LEGEND_WIDTH] = legend
     return combined
 
 

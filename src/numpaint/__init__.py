@@ -23,8 +23,8 @@ class Config:
     colors: int = 24
     max_size: int = 1024
     min_region_area: int | None = None
-    morph_kernel: int = 7
-    contour_simplify_eps: float = 0.02
+    morph_kernel: int = 5
+    contour_simplify_eps: float = 0.01
     draw_preview: bool = True
     draw_outline: bool = True
     auto_colors: bool = False
@@ -52,10 +52,10 @@ class ResultBundle:
 
 
 def _auto_min_region_area(h: int, w: int) -> int:
-    """Больший порог → меньше мелких областей, менее «шумный» рисунок."""
+    """Порог площади области: меньше значение — сохраняются тонкие детали (ноги, усики)."""
     area = h * w
-    rough = area // 400
-    return int(max(150, min(rough, 4000)))
+    rough = area // 600
+    return int(max(100, min(rough, 2500)))
 
 
 def generate_paint_by_numbers(

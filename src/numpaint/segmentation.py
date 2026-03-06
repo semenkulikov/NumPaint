@@ -80,6 +80,11 @@ def build_region_contours(
                 area = cv2.contourArea(cnt)
                 if area >= float(min_region_area):
                     continue
+                # Не сливать вытянутые области (ноги, усики): perimeter²/area >> 4π у круга
+                if area > 0:
+                    peri = cv2.arcLength(cnt, closed=True)
+                    if peri * peri / area > 22.0:
+                        continue
 
                 small_mask = np.zeros((h, w), dtype=np.uint8)
                 cv2.drawContours(small_mask, [cnt], contourIdx=-1, color=255, thickness=-1)

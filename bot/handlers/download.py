@@ -70,26 +70,32 @@ async def handle_image(message: Message) -> None:
 
     loop = asyncio.get_running_loop()
 
-    def _run_pipeline() -> Path | None:
+    def _run_pipeline() -> tuple[Path | None, Path | None]:
         cfg = Config()
         try:
             result = generate_paint_by_numbers(str(input_path), cfg)
         except Exception as exc:  # noqa: BLE001
             logger.exception("Ошибка пайплайна для пользователя {}: {}", user_id, exc)
-            return None
+            return None, None
 
         outline_path = user_dir / "outline.png"
+        colorized_path = user_dir / "colorized.png"
         if result.outline_image is not None:
             cv2.imwrite(str(outline_path), result.outline_image)
-            return outline_path
-        return None
+        if result.preview_image is not None:
+            cv2.imwrite(str(colorized_path), result.preview_image)
+        return outline_path, colorized_path
 
-    outline_path = await loop.run_in_executor(None, _run_pipeline)
+    outline_path, colorized_path = await loop.run_in_executor(None, _run_pipeline)
 
     if outline_path is None or not outline_path.exists():
         await message.answer("Не получилось обработать изображение. Попробуй другое или позже.")
         return
 
-    file = FSInputFile(str(outline_path))
-    await message.answer_photo(file, caption="Вот твоя раскраска по номерам.")
+    file_outline = FSInputFile(str(outline_path))
+    await message.answer_photo(file_outline, caption="Вот твоя раскраска по номерам (контур с номерами).")
+
+    if colorized_path is not None and colorized_path.exists():
+        file_colorized = FSInputFile(str(colorized_path))
+        await message.answer_photo(file_colorized, caption="Для сравнения — раскрашенный вариант по палитре.")
 
