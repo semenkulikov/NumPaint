@@ -7,3 +7,4 @@ loguru>=0.7.0
 python-dotenv>=1.0.0
 aiogram>=3.4.0
 pytest>=8.0.0
+potracer>=0.0.4

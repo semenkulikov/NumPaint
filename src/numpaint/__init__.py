@@ -52,10 +52,10 @@ class ResultBundle:
 
 
 def _auto_min_region_area(h: int, w: int) -> int:
-    """Порог площади области: меньше значение — сохраняются тонкие детали (ноги, усики)."""
+    """Порог площади: сливаем только мелкие округлые области; вытянутые не трогаем."""
     area = h * w
-    rough = area // 600
-    return int(max(100, min(rough, 2500)))
+    rough = area // 1000
+    return int(max(80, min(rough, 1200)))
 
 
 def generate_paint_by_numbers(

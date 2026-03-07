@@ -17,8 +17,8 @@ ArrayLike = np.ndarray
 
 # Минимальная площадь области (в пикселях), при которой рисуется номер; иначе — пропуск
 MIN_AREA_TO_DRAW_NUMBER = 200
-# Норма площади для масштаба шрифта: sqrt(area) / AREA_SCALE_FONT даёт множитель к font_scale
-AREA_SCALE_FONT = 55.0
+# Минимальное расстояние между центрами номеров (чтобы не накладывались вложенные области)
+MIN_DISTANCE_BETWEEN_NUMBERS = 24
 
 
 def build_palette_hex(palette_bgr: ArrayLike) -> list[str]:
@@ -201,28 +201,27 @@ def render_outline_with_numbers(
     boundary_line_thickness: int = 2,
 ) -> np.ndarray:
     """
-    Рисует контуры, номера внутри областей и легенду сбоку.
-    Границы строятся по карте меток (один пиксель границы на ребро), затем
-    рисуются чёрным; findContours по маске границ не используется, т.к. даёт
-    только внешние контуры связных компонент и теряет внутренние линии.
+    Рисует границы по единой маске (без пересечений), номера одного размера без наложения, легенду.
+    Размер цифр — по самой маленькой вписывающейся области. Вложенные области не перекрывают номера.
     """
     h, w = label_map.shape[:2]
     outline = np.full((h, w, 3), 255, dtype=np.uint8)
 
-    font_scale, thickness = _compute_font_params(h, w)
+    font_scale_base, thickness_base = _compute_font_params(h, w)
+    line_th = max(2, boundary_line_thickness)
 
+    # Границы по единой маске label_map (пиксельная маска + эллиптическое расширение)
     boundary = _build_boundary_mask(label_map)
-    if boundary_line_thickness <= 1:
-        outline[boundary.astype(bool)] = (0, 0, 0)
-    else:
-        kernel = np.ones((boundary_line_thickness, boundary_line_thickness), np.uint8)
-        boundary_thick = cv2.dilate(boundary, kernel)
-        outline[boundary_thick.astype(bool)] = (0, 0, 0)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (line_th, line_th))
+    boundary_thick = cv2.dilate(boundary, kernel)
+    outline[boundary_thick.astype(bool)] = (0, 0, 0)
 
-    # Рамка по размеру изображения (граница холста)
-    cv2.rectangle(outline, (0, 0), (w - 1, h - 1), (0, 0, 0), thickness=boundary_line_thickness)
+    # Рамка по размеру изображения
+    cv2.rectangle(outline, (0, 0), (w - 1, h - 1), (0, 0, 0), thickness=line_th)
 
-    # Номера: размещаем в самом широком месте контура, подбираем размер по вписыванию
+    # Один размер цифр: по самой маленькой вписывающейся области
+    scale_candidates = [1.0, 0.85, 0.7, 0.55, 0.45, 0.35, 0.28]
+    global_scale = float("inf")
     for color_idx, contours in contours_by_color.items():
         label_str = str(int(color_idx) + 1)
         for cnt in contours:
@@ -235,26 +234,64 @@ def render_outline_with_numbers(
                 cx, cy = layout.contour_center(cnt)
             if not (0 <= cx < w and 0 <= cy < h):
                 continue
-            for scale in [1.0, 0.75, 0.55, 0.4, 0.3]:
-                font_scale_region = max(0.25, font_scale * scale)
-                thickness_region = max(1, int(round(thickness * scale)))
-                (tw, th), _ = cv2.getTextSize(
-                    label_str, cv2.FONT_HERSHEY_SIMPLEX, font_scale_region, thickness_region
-                )
+            for scale in scale_candidates:
+                fs = max(0.22, font_scale_base * scale)
+                th = max(1, int(round(thickness_base * scale)))
+                (tw, th), _ = cv2.getTextSize(label_str, cv2.FONT_HERSHEY_SIMPLEX, fs, th)
                 if layout.rect_fits_in_contour(cnt_arr, cx, cy, tw, th):
-                    tx = cx - tw // 2
-                    ty = cy + th // 2
-                    cv2.putText(
-                        outline,
-                        label_str,
-                        (tx, ty),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        font_scale_region,
-                        (0, 0, 0),
-                        thickness_region,
-                        lineType=cv2.LINE_AA,
-                    )
+                    global_scale = min(global_scale, fs)
                     break
+
+    font_scale_uniform = max(0.22, global_scale) if global_scale != float("inf") else font_scale_base * 0.35
+    thickness_uniform = max(1, int(round(thickness_base * font_scale_uniform / font_scale_base)))
+    (tw_uni, th_uni), _ = cv2.getTextSize(
+        "24", cv2.FONT_HERSHEY_SIMPLEX, font_scale_uniform, thickness_uniform
+    )
+
+    # Собираем кандидатов для номеров, сортируем по площади (сначала крупные)
+    candidates: List[Tuple[int, int, float, str, int]] = []
+    for color_idx, contours in contours_by_color.items():
+        label_str = str(int(color_idx) + 1)
+        for cnt in contours:
+            area = cv2.contourArea(cnt)
+            if area < MIN_AREA_TO_DRAW_NUMBER:
+                continue
+            cnt_arr = np.asarray(cnt, dtype=np.int32)
+            cx, cy = layout.contour_widest_point(cnt_arr, (h, w))
+            if not (0 <= cx < w and 0 <= cy < h):
+                cx, cy = layout.contour_center(cnt)
+            if not (0 <= cx < w and 0 <= cy < h):
+                continue
+            if not layout.rect_fits_in_contour(cnt_arr, cx, cy, tw_uni, th_uni):
+                continue
+            candidates.append((cx, cy, area, label_str, color_idx))
+    candidates.sort(key=lambda x: -x[2])
+
+    # Рисуем номера без наложения: если центр слишком близко к уже нарисованному — пропускаем
+    placed: List[Tuple[int, int]] = []
+    for cx, cy, _area, label_str, _color_idx in candidates:
+        too_close = any(
+            (cx - px) ** 2 + (cy - py) ** 2 < MIN_DISTANCE_BETWEEN_NUMBERS ** 2
+            for px, py in placed
+        )
+        if too_close:
+            continue
+        placed.append((cx, cy))
+        (tw, th), _ = cv2.getTextSize(
+            label_str, cv2.FONT_HERSHEY_SIMPLEX, font_scale_uniform, thickness_uniform
+        )
+        tx = cx - tw // 2
+        ty = cy + th // 2
+        cv2.putText(
+            outline,
+            label_str,
+            (tx, ty),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            font_scale_uniform,
+            (0, 0, 0),
+            thickness_uniform,
+            lineType=cv2.LINE_AA,
+        )
 
     n_colors = len(palette_bgr)
     legend_height = max(h, n_colors * MIN_LEGEND_ROW_HEIGHT)
